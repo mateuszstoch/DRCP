@@ -1,7 +1,7 @@
 mod config;
 mod ui;
 
-use config::load_config;
+use config::{get_config_path, load_config};
 use ui::{render_dashboard, ConnectionStatus};
 
 use discord_rich_presence::{
@@ -10,28 +10,47 @@ use discord_rich_presence::{
 };
 use notify::{RecursiveMode, Watcher};
 use std::{
+    io::Write,
     path::Path,
     sync::mpsc::channel,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const CONFIG_PATH: &str = "config.toml";
 const RECONNECT_DELAY_SECS: u64 = 5;
 
 #[derive(Debug)]
 enum AppEvent {
     ReloadConfig,
     Tick,
+    KeyPress(crossterm::event::KeyEvent),
     Exit,
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Self {
+        let _ = crossterm::terminal::enable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
+        Self
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initial configuration setup
-    let mut config = match load_config(CONFIG_PATH) {
+    let config_path = get_config_path();
+    let mut config = match load_config(&config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("Błąd podczas wczytywania konfiguracji: {}", e);
-            eprintln!("Upewnij się, że plik {} jest poprawny.", CONFIG_PATH);
+            eprintln!("Error loading configuration: {}", e);
+            eprintln!("Please check if your config file is valid: {}", config_path.display());
             std::process::exit(1);
         }
     };
@@ -39,26 +58,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Prepare channel for events
     let (tx, rx) = channel();
 
-    // 2. Setup Ctrl+C handler
-    let tx_ctrlc = tx.clone();
-    ctrlc::set_handler(move || {
-        let _ = tx_ctrlc.send(AppEvent::Exit);
-    })?;
-
-    // 3. Setup File Watcher
+    // 2. Setup File Watcher (watching parent directory is more robust for safe saves)
     let tx_watcher = tx.clone();
-    // Keep watcher alive by assigning it to a variable
+    let watch_file = config_path.clone();
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
         if let Ok(event) = res {
-            // Only trigger reload on write or modify events to prevent spamming
             if event.kind.is_modify() || event.kind.is_create() {
-                let _ = tx_watcher.send(AppEvent::ReloadConfig);
+                if event.paths.iter().any(|p| p == &watch_file) {
+                    let _ = tx_watcher.send(AppEvent::ReloadConfig);
+                }
             }
         }
     })?;
-    let _ = watcher.watch(Path::new(CONFIG_PATH), RecursiveMode::NonRecursive);
+    if let Some(parent) = config_path.parent() {
+        let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
+    }
 
-    // 4. Setup Tick Thread
+    // 3. Setup Tick Thread
     let tx_tick = tx.clone();
     std::thread::spawn(move || {
         loop {
@@ -69,12 +85,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // 4. Setup Input Thread (captures key presses)
+    let tx_input = tx.clone();
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(crossterm::event::Event::Key(key_event)) = crossterm::event::read() {
+                if tx_input.send(AppEvent::KeyPress(key_event)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Enable raw mode and hide cursor (using drop guard for automatic restoration on panic)
+    let _guard = RawModeGuard::new();
+
     // Send initial tick to trigger immediate connection attempt
     let _ = tx.send(AppEvent::Tick);
-
-    // Hide terminal cursor for better UI experience
-    let mut stdout = std::io::stdout();
-    let _ = crossterm::execute!(stdout, crossterm::cursor::Hide);
 
     // State variables
     let start_time = Instant::now();
@@ -100,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &config,
             start_time.elapsed(),
             error_msg.as_deref(),
+            &config_path,
         );
 
         // Wait for next event
@@ -110,16 +138,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match event {
             AppEvent::ReloadConfig => {
-                // Reload configuration
-                match load_config(CONFIG_PATH) {
+                match load_config(&config_path) {
                     Ok(new_cfg) => {
-                        // Check if client_id changed
                         let client_id_changed = new_cfg.client_id != config.client_id;
                         config = new_cfg;
                         error_msg = None;
                         
                         if client_id_changed {
-                            // Close old client and reset to force new creation
                             if let Some(mut old_client) = client.take() {
                                 let _ = old_client.close();
                             }
@@ -130,7 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         force_update = true;
                     }
                     Err(e) => {
-                        error_msg = Some(format!("Błąd przeładowania pliku config: {}", e));
+                        error_msg = Some(format!("Error reloading config: {}", e));
                     }
                 }
             }
@@ -142,9 +167,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         reconnect_timer -= 1;
                         status = ConnectionStatus::Reconnecting(reconnect_timer);
                     } else {
-                        // Attempt connection
                         status = ConnectionStatus::Reconnecting(0);
-                        render_dashboard(status, &config, start_time.elapsed(), error_msg.as_deref());
+                        render_dashboard(status, &config, start_time.elapsed(), error_msg.as_deref(), &config_path);
                         
                         let mut new_client = DiscordIpcClient::new(&config.client_id);
                         match new_client.connect() {
@@ -156,14 +180,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 last_activity_update = Instant::now();
                             }
                             Err(e) => {
-                                error_msg = Some(format!("Błąd połączenia z IPC Discorda: {}", e));
+                                error_msg = Some(format!("Error connecting to Discord IPC: {}", e));
                                 status = ConnectionStatus::Reconnecting(RECONNECT_DELAY_SECS);
                                 reconnect_timer = RECONNECT_DELAY_SECS;
                             }
                         }
                     }
                 } else if is_connected {
-                    // Check if we need to update activity (every 15s or when forced)
                     if force_update || last_activity_update.elapsed() >= Duration::from_secs(15) {
                         if let Some(ref mut cl) = client {
                             let activity = build_activity(&config.presence, start_timestamp_ms);
@@ -174,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     last_activity_update = Instant::now();
                                 }
                                 Err(e) => {
-                                    error_msg = Some(format!("Błąd wysyłania aktywności: {}", e));
+                                    error_msg = Some(format!("Error updating activity: {}", e));
                                     status = ConnectionStatus::Disconnected;
                                     reconnect_timer = RECONNECT_DELAY_SECS;
                                     client = None;
@@ -184,11 +207,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            AppEvent::KeyPress(key_event) => {
+                use crossterm::event::{KeyCode, KeyModifiers};
+
+                // Check for Ctrl+C to exit
+                if key_event.code == KeyCode::Char('c') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                    let _ = tx.send(AppEvent::Exit);
+                }
+
+                // Check for E to enter edit menu
+                if key_event.code == KeyCode::Char('e') || key_event.code == KeyCode::Char('E') {
+                    // Temporarily disable raw mode and show cursor
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+
+                    handle_edit_menu(&mut config, &config_path);
+
+                    // Re-enable raw mode and hide cursor
+                    let _ = crossterm::terminal::enable_raw_mode();
+                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
+
+                    force_update = true;
+                }
+            }
             AppEvent::Exit => {
-                // Restore terminal cursor
-                let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
-                
-                // Clear Discord status before exiting
+                // Clear Discord status before exiting (raw mode will be disabled automatically by Drop guard)
                 if let Some(mut cl) = client.take() {
                     let _ = cl.clear_activity();
                     let _ = cl.close();
@@ -201,13 +244,143 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     crossterm::cursor::MoveTo(0, 0)
                 );
                 
-                println!("DURCP zakończył działanie. Miłego dnia!");
+                println!("DRCP stopped. Goodbye!");
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+fn handle_edit_menu(config: &mut config::AppConfig, config_path: &Path) {
+    loop {
+        // Clear screen using ANSI escapes
+        print!("{}[2J{}[1;1H", 27 as char, 27 as char);
+        println!("========================================================");
+        println!("              EDIT PRESENCE CONFIGURATION               ");
+        println!("========================================================");
+        println!("  1. Client ID          : {}", config.client_id);
+        println!("  2. Details            : {}", config.presence.details.as_deref().unwrap_or(""));
+        println!("  3. State              : {}", config.presence.state.as_deref().unwrap_or(""));
+        println!("  4. Large Image Key    : {}", config.presence.large_image.as_deref().unwrap_or(""));
+        println!("  5. Large Image Text   : {}", config.presence.large_text.as_deref().unwrap_or(""));
+        println!("  6. Small Image Key    : {}", config.presence.small_image.as_deref().unwrap_or(""));
+        println!("  7. Small Image Text   : {}", config.presence.small_text.as_deref().unwrap_or(""));
+        println!("  8. Configure Buttons  ");
+        println!("  9. Save & Back to Dashboard");
+        println!("========================================================");
+        print!("Select an option (1-9): ");
+        let _ = std::io::stdout().flush();
+
+        let mut choice = String::new();
+        if std::io::stdin().read_line(&mut choice).is_err() {
+            break;
+        }
+
+        let choice = choice.trim();
+        if choice == "9" {
+            if let Err(e) = config::save_config(config, config_path) {
+                println!("Error saving config: {}", e);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            break;
+        }
+
+        match choice {
+            "1" => {
+                print!("Enter Client ID: ");
+                let _ = std::io::stdout().flush();
+                let mut val = String::new();
+                let _ = std::io::stdin().read_line(&mut val);
+                config.client_id = val.trim().to_string();
+            }
+            "2" => {
+                print!("Enter Details: ");
+                let _ = std::io::stdout().flush();
+                let mut val = String::new();
+                let _ = std::io::stdin().read_line(&mut val);
+                config.presence.details = Some(val.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            "3" => {
+                print!("Enter State: ");
+                let _ = std::io::stdout().flush();
+                let mut val = String::new();
+                let _ = std::io::stdin().read_line(&mut val);
+                config.presence.state = Some(val.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            "4" => {
+                print!("Enter Large Image Key: ");
+                let _ = std::io::stdout().flush();
+                let mut val = String::new();
+                let _ = std::io::stdin().read_line(&mut val);
+                config.presence.large_image = Some(val.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            "5" => {
+                print!("Enter Large Image Hover Text: ");
+                let _ = std::io::stdout().flush();
+                let mut val = String::new();
+                let _ = std::io::stdin().read_line(&mut val);
+                config.presence.large_text = Some(val.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            "6" => {
+                print!("Enter Small Image Key: ");
+                let _ = std::io::stdout().flush();
+                let mut val = String::new();
+                let _ = std::io::stdin().read_line(&mut val);
+                config.presence.small_image = Some(val.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            "7" => {
+                print!("Enter Small Image Hover Text: ");
+                let _ = std::io::stdout().flush();
+                let mut val = String::new();
+                let _ = std::io::stdin().read_line(&mut val);
+                config.presence.small_text = Some(val.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            "8" => {
+                println!("\n--- Current Buttons ---");
+                if let Some(ref btns) = config.presence.buttons {
+                    for (i, btn) in btns.iter().enumerate() {
+                        println!("{}. {} -> {}", i + 1, btn.label, btn.url);
+                    }
+                } else {
+                    println!("No buttons configured.");
+                }
+                print!("\nWould you like to (c)lear all buttons, or (a)dd a new button? (c/a/back): ");
+                let _ = std::io::stdout().flush();
+                let mut btn_choice = String::new();
+                let _ = std::io::stdin().read_line(&mut btn_choice);
+                let btn_choice = btn_choice.trim().to_lowercase();
+                
+                if btn_choice == "c" {
+                    config.presence.buttons = None;
+                } else if btn_choice == "a" {
+                    let mut buttons = config.presence.buttons.clone().unwrap_or_default();
+                    if buttons.len() >= 2 {
+                        println!("Discord only supports up to 2 buttons! Clear existing buttons first.");
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                    print!("Enter button label: ");
+                    let _ = std::io::stdout().flush();
+                    let mut label = String::new();
+                    let _ = std::io::stdin().read_line(&mut label);
+                    
+                    print!("Enter button URL: ");
+                    let _ = std::io::stdout().flush();
+                    let mut url = String::new();
+                    let _ = std::io::stdin().read_line(&mut url);
+                    
+                    buttons.push(config::PresenceButton {
+                        label: label.trim().to_string(),
+                        url: url.trim().to_string(),
+                    });
+                    config.presence.buttons = Some(buttons);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn build_activity<'a>(presence: &'a config::PresenceConfig, start_time_ms: i64) -> Activity<'a> {

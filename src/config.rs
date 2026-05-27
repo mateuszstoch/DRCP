@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PresenceButton {
@@ -58,12 +58,41 @@ impl Default for AppConfig {
     }
 }
 
-pub fn load_config<P: AsRef<Path>>(path: P) -> Result<AppConfig, Box<dyn std::error::Error>> {
-    let path = path.as_ref();
-    if !path.exists() {
-        let default_config = AppConfig::default();
-        let toml_string = toml::to_string_pretty(&default_config)?;
-        let banner = r#"# Discord Rich Presence (DRCP) Configuration
+pub fn get_config_path() -> PathBuf {
+    // If config.toml exists in the current working directory, use it (local dev fallback)
+    let local_path = PathBuf::from("config.toml");
+    if local_path.exists() {
+        return local_path;
+    }
+
+    // Otherwise, resolve standard config directory:
+    // macOS/Linux: ~/.config/drcp/config.toml
+    // Windows: %APPDATA%/drcp/config.toml
+    let mut path = if cfg!(windows) {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            PathBuf::from(appdata)
+        } else {
+            PathBuf::from(".")
+        }
+    } else {
+        if let Ok(home) = std::env::var("HOME") {
+            let mut p = PathBuf::from(home);
+            p.push(".config");
+            p
+        } else {
+            PathBuf::from(".")
+        }
+    };
+
+    path.push("drcp");
+    let _ = fs::create_dir_all(&path);
+    path.push("config.toml");
+    path
+}
+
+pub fn save_config(config: &AppConfig, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let toml_string = toml::to_string_pretty(config)?;
+    let banner = r#"# Discord Rich Presence (DRCP) Configuration
 # 
 # To make the presence work with your custom assets:
 # 1. Go to https://discord.com/developers/applications
@@ -74,9 +103,17 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<AppConfig, Box<dyn std::er
 # 6. Changes to this file are automatically reloaded by the running application!
 
 "#;
-        let mut file_content = banner.to_string();
-        file_content.push_str(&toml_string);
-        fs::write(path, file_content)?;
+    let mut file_content = banner.to_string();
+    file_content.push_str(&toml_string);
+    fs::write(path, file_content)?;
+    Ok(())
+}
+
+pub fn load_config<P: AsRef<Path>>(path: P) -> Result<AppConfig, Box<dyn std::error::Error>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        let default_config = AppConfig::default();
+        save_config(&default_config, path)?;
     }
 
     let content = fs::read_to_string(path)?;

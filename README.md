@@ -46,7 +46,14 @@ On first startup, the app creates a default `config.toml` in your working direct
 
 ## Configuration
 
-All presence options are defined in `config.toml`:
+All presence options are defined in `config.toml`. 
+
+By default:
+- On **macOS and Linux**, the config file is located at `~/.config/drcp/config.toml`.
+- On **Windows**, the config file is located at `%APPDATA%\drcp\config.toml`.
+- If a `config.toml` is found in the current working directory, DRCP will use it instead (useful for local development).
+
+The structure of the `config.toml` file is as follows:
 
 ```toml
 client_id = "123456789012345678" # Your Discord application Client ID
@@ -90,8 +97,10 @@ To customize the application name, logos, and hover-texts:
 ## Usage
 
 1. Run the `drcp` executable.
-2. Edit `config.toml` to customize your status. The CLI will pick up changes on file save.
-3. Exit by pressing `Ctrl+C`.
+2. The CLI will open the active dashboard showing your status.
+3. **Interactive Console Editing**: Press `E` in your terminal to open the interactive configuration editor. You can update your Client ID, details, images, and buttons directly from the console. DRCP will save the updates to your config file and apply them instantly!
+4. **Manual Editing**: Alternatively, edit your config file directly (DRCP displays the path to the active `config.toml` in the UI). The CLI will pick up changes on file save.
+5. Exit by pressing `Ctrl+C`.
 
 ---
 

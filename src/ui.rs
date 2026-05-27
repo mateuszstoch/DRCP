@@ -6,6 +6,7 @@ use crossterm::{
     terminal,
 };
 use std::io::{stdout, Write};
+use std::path::Path;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,7 @@ pub fn render_dashboard(
     config: &AppConfig,
     uptime: Duration,
     error_msg: Option<&str>,
+    config_path: &Path,
 ) {
     let mut stdout = stdout();
     
@@ -42,11 +44,12 @@ pub fn render_dashboard(
     let uptime_str = format!("{:02}:{:02}:{:02}", hours, minutes, seconds).cyan();
 
     println!("{}", "========================================================".blue());
-    println!("     {}      ", "DISCORD RICH PRESENCE (DURCP) - ACTIVE".bold().white());
+    println!("     {}      ", "DISCORD RICH PRESENCE (DRCP) - ACTIVE".bold().white());
     println!("{}", "========================================================".blue());
     
     println!("  Status:   {}", status_str);
     println!("  Uptime:   {}", uptime_str);
+    println!("  Config:   {}", config_path.display().to_string().cyan());
     println!("{}", "--------------------------------------------------------".blue());
     println!("  Client ID: {}", config.client_id.magenta());
     
@@ -90,6 +93,7 @@ pub fn render_dashboard(
     println!("\n{}", "========================================================".blue());
     println!("  {}", "Instructions:".white().bold());
     println!("  * Edit {} to dynamically update this status.", "config.toml".cyan());
+    println!("  * Press {} to configure directly from console.", "E".yellow().bold());
     println!("  * Press {} to terminate the application.", "Ctrl+C".red().bold());
     println!("{}", "========================================================".blue());
     
