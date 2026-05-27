@@ -22,7 +22,7 @@ It features file-watching on `config.toml`, meaning you can edit your status in 
 #### macOS & Linux
 Run the following script in your terminal to fetch and install the latest binary:
 ```bash
-curl -sSfL https://raw.githubusercontent.com/mateuszstoch/DRCP/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/mateuszstoch/DRCP/main/scripts/install.sh | sh
 ```
 *(Alternatively, download the target binary for your architecture from the GitHub Releases page).*
 
