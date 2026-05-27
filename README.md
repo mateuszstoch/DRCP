@@ -108,6 +108,34 @@ To customize the application name, logos, and hover-texts:
 
 ---
 
+## Running in the Background
+
+Since DRCP requires the process to be running to keep your Discord status active, you can run it in the background so it doesn't occupy a terminal window. DRCP will automatically detect that it's not running in an interactive terminal (non-TTY fallback) and run silently as a file-watching background daemon.
+
+### macOS & Linux (Unix)
+
+Use `nohup` to start the process detached from the terminal:
+```bash
+nohup drcp > /dev/null 2>&1 &
+```
+To stop the background process:
+```bash
+killall drcp
+```
+
+### Windows (PowerShell)
+
+Run the executable in a hidden background window:
+```powershell
+Start-Process -FilePath "drcp.exe" -WindowStyle Hidden
+```
+To stop the background process:
+```powershell
+Stop-Process -Name drcp
+```
+
+---
+
 ## License
 
 MIT
