@@ -10,7 +10,7 @@ use discord_rich_presence::{
 };
 use notify::{RecursiveMode, Watcher};
 use std::{
-    io::Write,
+    io::{IsTerminal, Write},
     path::Path,
     sync::mpsc::channel,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -29,7 +29,8 @@ struct RawModeGuard {
 
 impl RawModeGuard {
     fn new() -> Self {
-        let active = crossterm::terminal::enable_raw_mode().is_ok();
+        let is_terminal = std::io::stdin().is_terminal();
+        let active = is_terminal && crossterm::terminal::enable_raw_mode().is_ok();
         if active {
             let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
         }
