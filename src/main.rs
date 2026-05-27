@@ -21,25 +21,28 @@ const RECONNECT_DELAY_SECS: u64 = 5;
 #[derive(Debug)]
 enum AppEvent {
     ReloadConfig,
-    Tick,
-    KeyPress(crossterm::event::KeyEvent),
-    Exit,
 }
 
-struct RawModeGuard;
+struct RawModeGuard {
+    active: bool,
+}
 
 impl RawModeGuard {
     fn new() -> Self {
-        let _ = crossterm::terminal::enable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
-        Self
+        let active = crossterm::terminal::enable_raw_mode().is_ok();
+        if active {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
+        }
+        Self { active }
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        if self.active {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        }
     }
 }
 
@@ -55,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Prepare channel for events
+    // Prepare channel for file watcher events
     let (tx, rx) = channel();
 
     // 2. Setup File Watcher (watching parent directory is more robust for safe saves)
@@ -74,34 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
     }
 
-    // 3. Setup Tick Thread
-    let tx_tick = tx.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-            if tx_tick.send(AppEvent::Tick).is_err() {
-                break;
-            }
-        }
-    });
-
-    // 4. Setup Input Thread (captures key presses)
-    let tx_input = tx.clone();
-    std::thread::spawn(move || {
-        loop {
-            if let Ok(crossterm::event::Event::Key(key_event)) = crossterm::event::read() {
-                if tx_input.send(AppEvent::KeyPress(key_event)).is_err() {
-                    break;
-                }
-            }
-        }
-    });
-
-    // Enable raw mode and hide cursor (using drop guard for automatic restoration on panic)
-    let _guard = RawModeGuard::new();
-
-    // Send initial tick to trigger immediate connection attempt
-    let _ = tx.send(AppEvent::Tick);
+    // Enable raw mode and hide cursor (if supported by the TTY)
+    let guard = RawModeGuard::new();
+    let interactive = guard.active;
 
     // State variables
     let start_time = Instant::now();
@@ -115,140 +93,153 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut error_msg: Option<String> = None;
     let mut reconnect_timer = 0;
     
-    // We update status every 15s to keep it alive/detect drops
+    let mut last_tick = Instant::now() - Duration::from_secs(1); // Force immediate tick logic on startup
     let mut last_activity_update = Instant::now();
     let mut force_update = true;
 
     // Main loop
     loop {
-        // Render dashboard
-        render_dashboard(
-            status,
-            &config,
-            start_time.elapsed(),
-            error_msg.as_deref(),
-            &config_path,
-        );
-
-        // Wait for next event
-        let event = match rx.recv() {
-            Ok(evt) => evt,
-            Err(_) => break,
-        };
-
-        match event {
-            AppEvent::ReloadConfig => {
-                match load_config(&config_path) {
-                    Ok(new_cfg) => {
-                        let client_id_changed = new_cfg.client_id != config.client_id;
-                        config = new_cfg;
-                        error_msg = None;
-                        
-                        if client_id_changed {
-                            if let Some(mut old_client) = client.take() {
-                                let _ = old_client.close();
+        // 1. Process file watcher config reload events (non-blocking)
+        while let Ok(evt) = rx.try_recv() {
+            match evt {
+                AppEvent::ReloadConfig => {
+                    match load_config(&config_path) {
+                        Ok(new_cfg) => {
+                            let client_id_changed = new_cfg.client_id != config.client_id;
+                            config = new_cfg;
+                            error_msg = None;
+                            
+                            if client_id_changed {
+                                if let Some(mut old_client) = client.take() {
+                                    let _ = old_client.close();
+                                }
+                                status = ConnectionStatus::Disconnected;
+                                reconnect_timer = 0;
                             }
-                            status = ConnectionStatus::Disconnected;
-                            reconnect_timer = 0;
+                            
+                            force_update = true;
                         }
-                        
-                        force_update = true;
-                    }
-                    Err(e) => {
-                        error_msg = Some(format!("Error reloading config: {}", e));
+                        Err(e) => {
+                            error_msg = Some(format!("Error reloading config: {}", e));
+                        }
                     }
                 }
             }
-            AppEvent::Tick => {
-                let is_connected = status == ConnectionStatus::Connected;
-                
-                if !is_connected {
-                    if reconnect_timer > 0 {
-                        reconnect_timer -= 1;
-                        status = ConnectionStatus::Reconnecting(reconnect_timer);
-                    } else {
-                        status = ConnectionStatus::Reconnecting(0);
-                        render_dashboard(status, &config, start_time.elapsed(), error_msg.as_deref(), &config_path);
-                        
-                        let mut new_client = DiscordIpcClient::new(&config.client_id);
-                        match new_client.connect() {
+        }
+
+        // 2. Poll for terminal key input (if running in an interactive TTY)
+        if interactive {
+            if crossterm::event::poll(Duration::from_millis(50))? {
+                if let crossterm::event::Event::Key(key_event) = crossterm::event::read()? {
+                    // Filter key presses to avoid release/repeat duplication
+                    if key_event.kind == crossterm::event::KeyEventKind::Press {
+                        use crossterm::event::{KeyCode, KeyModifiers};
+
+                        // Ctrl+C to exit
+                        if key_event.code == KeyCode::Char('c') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                            break;
+                        }
+
+                        // E to enter edit menu
+                        if key_event.code == KeyCode::Char('e') || key_event.code == KeyCode::Char('E') {
+                            // Temporarily disable raw mode and show cursor
+                            let _ = crossterm::terminal::disable_raw_mode();
+                            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+
+                            handle_edit_menu(&mut config, &config_path);
+
+                            // Re-enable raw mode and hide cursor
+                            let _ = crossterm::terminal::enable_raw_mode();
+                            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
+
+                            force_update = true;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Non-interactive fallback: just sleep briefly to avoid CPU pinning
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // 3. Process tick logic (every 1 second)
+        if last_tick.elapsed() >= Duration::from_secs(1) {
+            last_tick = Instant::now();
+            
+            let is_connected = status == ConnectionStatus::Connected;
+            
+            if !is_connected {
+                if reconnect_timer > 0 {
+                    reconnect_timer -= 1;
+                    status = ConnectionStatus::Reconnecting(reconnect_timer);
+                } else {
+                    status = ConnectionStatus::Reconnecting(0);
+                    render_dashboard(status, &config, start_time.elapsed(), error_msg.as_deref(), &config_path, interactive);
+                    
+                    let mut new_client = DiscordIpcClient::new(&config.client_id);
+                    match new_client.connect() {
+                        Ok(()) => {
+                            client = Some(new_client);
+                            status = ConnectionStatus::Connected;
+                            error_msg = None;
+                            force_update = true;
+                            last_activity_update = Instant::now();
+                        }
+                        Err(e) => {
+                            error_msg = Some(format!("Error connecting to Discord IPC: {}", e));
+                            status = ConnectionStatus::Reconnecting(RECONNECT_DELAY_SECS);
+                            reconnect_timer = RECONNECT_DELAY_SECS;
+                        }
+                    }
+                }
+            } else if is_connected {
+                if force_update || last_activity_update.elapsed() >= Duration::from_secs(15) {
+                    if let Some(ref mut cl) = client {
+                        let activity = build_activity(&config.presence, start_timestamp_ms);
+                        match cl.set_activity(activity) {
                             Ok(()) => {
-                                client = Some(new_client);
-                                status = ConnectionStatus::Connected;
                                 error_msg = None;
-                                force_update = true;
+                                force_update = false;
                                 last_activity_update = Instant::now();
                             }
                             Err(e) => {
-                                error_msg = Some(format!("Error connecting to Discord IPC: {}", e));
-                                status = ConnectionStatus::Reconnecting(RECONNECT_DELAY_SECS);
+                                error_msg = Some(format!("Error updating activity: {}", e));
+                                status = ConnectionStatus::Disconnected;
                                 reconnect_timer = RECONNECT_DELAY_SECS;
-                            }
-                        }
-                    }
-                } else if is_connected {
-                    if force_update || last_activity_update.elapsed() >= Duration::from_secs(15) {
-                        if let Some(ref mut cl) = client {
-                            let activity = build_activity(&config.presence, start_timestamp_ms);
-                            match cl.set_activity(activity) {
-                                Ok(()) => {
-                                    error_msg = None;
-                                    force_update = false;
-                                    last_activity_update = Instant::now();
-                                }
-                                Err(e) => {
-                                    error_msg = Some(format!("Error updating activity: {}", e));
-                                    status = ConnectionStatus::Disconnected;
-                                    reconnect_timer = RECONNECT_DELAY_SECS;
-                                    client = None;
-                                }
+                                client = None;
                             }
                         }
                     }
                 }
             }
-            AppEvent::KeyPress(key_event) => {
-                use crossterm::event::{KeyCode, KeyModifiers};
 
-                // Check for Ctrl+C to exit
-                if key_event.code == KeyCode::Char('c') && key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                    let _ = tx.send(AppEvent::Exit);
-                }
-
-                // Check for E to enter edit menu
-                if key_event.code == KeyCode::Char('e') || key_event.code == KeyCode::Char('E') {
-                    // Temporarily disable raw mode and show cursor
-                    let _ = crossterm::terminal::disable_raw_mode();
-                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
-
-                    handle_edit_menu(&mut config, &config_path);
-
-                    // Re-enable raw mode and hide cursor
-                    let _ = crossterm::terminal::enable_raw_mode();
-                    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
-
-                    force_update = true;
-                }
-            }
-            AppEvent::Exit => {
-                // Clear Discord status before exiting (raw mode will be disabled automatically by Drop guard)
-                if let Some(mut cl) = client.take() {
-                    let _ = cl.clear_activity();
-                    let _ = cl.close();
-                }
-                
-                // Clear screen to leave terminal clean
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                    crossterm::cursor::MoveTo(0, 0)
-                );
-                
-                println!("DRCP stopped. Goodbye!");
-                break;
-            }
+            // Render dashboard on every tick
+            render_dashboard(
+                status,
+                &config,
+                start_time.elapsed(),
+                error_msg.as_deref(),
+                &config_path,
+                interactive,
+            );
         }
     }
+
+    // Clean exit
+    if let Some(mut cl) = client.take() {
+        let _ = cl.clear_activity();
+        let _ = cl.close();
+    }
+    
+    // Clear screen to leave terminal clean (only if raw mode was active)
+    if interactive {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0)
+        );
+    }
+    println!("DRCP stopped. Goodbye!");
 
     Ok(())
 }
