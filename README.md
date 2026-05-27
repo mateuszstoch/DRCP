@@ -116,7 +116,7 @@ Since DRCP requires the process to be running to keep your Discord status active
 
 Use `nohup` to start the process detached from the terminal:
 ```bash
-nohup drcp > /dev/null 2>&1 &
+nohup drcp < /dev/null > /dev/null 2>&1 &
 ```
 To stop the background process:
 ```bash
