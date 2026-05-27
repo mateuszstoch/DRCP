@@ -27,7 +27,11 @@ curl -sSfL https://raw.githubusercontent.com/mateuszstoch/DRCP/main/scripts/inst
 *(Alternatively, download the target binary for your architecture from the GitHub Releases page).*
 
 #### Windows
-Download the `drcp.exe` executable from the GitHub Releases page and run it from your command line.
+Run the following command in PowerShell to fetch and install the latest binary:
+```powershell
+irm https://raw.githubusercontent.com/mateuszstoch/DRCP/main/scripts/install.ps1 | iex
+```
+*(Alternatively, download the target zip archive from the GitHub Releases page, extract it, and run the executable).*
 
 ---
 
